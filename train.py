@@ -16,19 +16,47 @@ import numpy as np
 import torch
 from dm_env import specs
 
-import dmc
-import utils
+import utils as utils
+import drqv2
 from logger import Logger
 from replay_buffer import ReplayBufferStorage, make_replay_loader
 from video import TrainVideoRecorder, VideoRecorder
+from mlagents_envs.environment import UnityEnvironment
+from mlagents_envs.side_channel.engine_configuration_channel import EngineConfigurationChannel
+from mlagents_envs.side_channel.environment_parameters_channel import EnvironmentParametersChannel
+from mlagents_envs.envs.unity_gym_env import UnityToGymWrapper
+import gym
 
 torch.backends.cudnn.benchmark = True
 
 
 def make_agent(obs_spec, action_spec, cfg):
-    cfg.obs_shape = obs_spec.shape
-    cfg.action_shape = action_spec.shape
-    return hydra.utils.instantiate(cfg)
+	cfg.obs_shape = obs_spec.shape
+	cfg.action_shape = action_spec.shape
+	return hydra.utils.instantiate(cfg)
+
+def make_unity_env():
+	channel = EngineConfigurationChannel()
+	currpath = (os.path.dirname(os.path.abspath(__file__)))
+
+	unity_env = UnityEnvironment(file_name=os.path.join(currpath,"envs/Crawlerv2/Crawler.x86_64"), side_channels=[channel], worker_id=2)
+
+	# unity_env = UnityEnvironment(file_name=os.path.join(currpath,"envs/ClothFold/ClothFold.x86_64"), side_channels=[channel], worker_id=2)
+	channel.set_configuration_parameters(time_scale = 5)
+
+	# unity_env = UnityEnvironment(file_name=, seed=1, side_channels=[], worker_id=2)
+	unity_env.reset()
+	env = UnityToGymWrapper(unity_env, uint8_visual=True)
+	#TODO: fix shape stack
+	observation_spec = specs.BoundedArray(shape=(9,84,84), dtype=np.uint8, name='observation', minimum=0, maximum=255)
+
+	# observation_spec = specs.BoundedArray(shape=np.insert(env.observation_space.shape, 0, 1), dtype=env.observation_space.dtype, minimum=0., maximum=1.)
+	action_spec = specs.BoundedArray(shape=env.action_space.shape, dtype=env.action_space.dtype, name='action', minimum =env.action_space.low, maximum=env.action_space.high)
+
+	return env, observation_spec, action_spec
+def un_normalize(obs):
+	return np.asarray(obs).transpose(2,1,0)
+	return obs#u_obs
 
 
 class Workspace:
@@ -39,10 +67,13 @@ class Workspace:
         self.cfg = cfg
         utils.set_seed_everywhere(cfg.seed)
         self.device = torch.device(cfg.device)
+
+        self.observation_spec = None
+        self.action_spec = None
         self.setup()
 
-        self.agent = make_agent(self.train_env.observation_spec(),
-                                self.train_env.action_spec(),
+        self.agent = make_agent(self.observation_spec,
+                                self.action_spec,
                                 self.cfg.agent)
         self.timer = utils.Timer()
         self._global_step = 0
@@ -52,15 +83,12 @@ class Workspace:
         # create logger
         self.logger = Logger(self.work_dir, use_tb=self.cfg.use_tb)
         # create envs
-        self.train_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
-                                  self.cfg.action_repeat, self.cfg.seed)
-        self.eval_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
-                                 self.cfg.action_repeat, self.cfg.seed)
+        self.train_env, self.observation_spec, self.action_spec = make_unity_env()
         # create replay buffer
-        data_specs = (self.train_env.observation_spec(),
-                      self.train_env.action_spec(),
-                      specs.Array((1,), np.float32, 'reward'),
-                      specs.Array((1,), np.float32, 'discount'))
+        data_specs = (self.observation_spec,
+                        self.action_spec,
+                        specs.Array((1,), np.float32, 'reward'),
+                        specs.Array((1,), np.float32, 'discount'))
 
         self.replay_storage = ReplayBufferStorage(data_specs,
                                                   self.work_dir / 'buffer')
@@ -71,7 +99,7 @@ class Workspace:
             self.cfg.save_snapshot, self.cfg.nstep, self.cfg.discount)
         self._replay_iter = None
 
-        self.video_recorder = VideoRecorder(
+        self.video_recorder = TrainVideoRecorder(
             self.work_dir if self.cfg.save_video else None)
         self.train_video_recorder = TrainVideoRecorder(
             self.work_dir if self.cfg.save_train_video else None)
@@ -98,18 +126,21 @@ class Workspace:
     def eval(self):
         step, episode, total_reward = 0, 0, 0
         eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
+        observation = None
 
         while eval_until_episode(episode):
-            time_step = self.eval_env.reset()
-            self.video_recorder.init(self.eval_env, enabled=(episode == 0))
-            while not time_step.last():
+            observation = un_normalize(self.train_env.reset())
+            done = False
+            self.video_recorder.init(observation, enabled=(episode == 0))
+            while not done:
                 with torch.no_grad(), utils.eval_mode(self.agent):
-                    action = self.agent.act(time_step.observation,
+                    action = self.agent.act(observation,
                                             self.global_step,
                                             eval_mode=True)
-                time_step = self.eval_env.step(action)
-                self.video_recorder.record(self.eval_env)
-                total_reward += time_step.reward
+                n_observation, reward, done, info = self.train_env.step(action)
+                observation = un_normalize(n_observation)
+                self.video_recorder.record(observation)
+                total_reward += reward
                 step += 1
 
             episode += 1
@@ -124,19 +155,22 @@ class Workspace:
     def train(self):
         # predicates
         train_until_step = utils.Until(self.cfg.num_train_frames,
-                                       self.cfg.action_repeat)
+                                        self.cfg.action_repeat)
         seed_until_step = utils.Until(self.cfg.num_seed_frames,
-                                      self.cfg.action_repeat)
+                                        self.cfg.action_repeat)
         eval_every_step = utils.Every(self.cfg.eval_every_frames,
-                                      self.cfg.action_repeat)
+                                        self.cfg.action_repeat)
 
         episode_step, episode_reward = 0, 0
-        time_step = self.train_env.reset()
-        self.replay_storage.add(time_step)
-        self.train_video_recorder.init(time_step.observation)
+        observation = un_normalize(self.train_env.reset())
+        action = np.zeros(self.action_spec.shape, dtype=self.action_spec.dtype)
+        discount = self.cfg.discount
+        self.replay_storage.add(observation, action, discount, 0.0, False)
+        self.train_video_recorder.init(observation)
         metrics = None
+        done = False
         while train_until_step(self.global_step):
-            if time_step.last():
+            if done:
                 self._global_episode += 1
                 self.train_video_recorder.save(f'{self.global_frame}.mp4')
                 # wait until all the metrics schema is populated
@@ -155,9 +189,12 @@ class Workspace:
                         log('step', self.global_step)
 
                 # reset env
-                time_step = self.train_env.reset()
-                self.replay_storage.add(time_step)
-                self.train_video_recorder.init(time_step.observation)
+                observation = un_normalize(self.train_env.reset())
+                action = np.zeros(self.action_spec.shape, dtype=self.action_spec.dtype)
+                reward = 0.0
+                done = False
+                self.replay_storage.add(observation, action, discount, reward, done)
+                self.train_video_recorder.init(observation)
                 # try to save snapshot
                 if self.cfg.save_snapshot:
                     self.save_snapshot()
@@ -169,10 +206,14 @@ class Workspace:
                 self.logger.log('eval_total_time', self.timer.total_time(),
                                 self.global_frame)
                 self.eval()
+                observation = un_normalize(self.train_env.reset())
+                action = np.zeros(self.action_spec.shape, dtype=self.action_spec.dtype)
+                reward = 0.0
+                done = False
 
             # sample action
             with torch.no_grad(), utils.eval_mode(self.agent):
-                action = self.agent.act(time_step.observation,
+                action = self.agent.act(observation,
                                         self.global_step,
                                         eval_mode=False)
 
@@ -182,10 +223,12 @@ class Workspace:
                 self.logger.log_metrics(metrics, self.global_frame, ty='train')
 
             # take env step
-            time_step = self.train_env.step(action)
-            episode_reward += time_step.reward
-            self.replay_storage.add(time_step)
-            self.train_video_recorder.record(time_step.observation)
+            n_observation, reward, done, info = self.train_env.step(action)
+            observation = un_normalize(n_observation)
+
+            episode_reward += reward
+            self.replay_storage.add(observation, action, discount, reward, done)
+            self.train_video_recorder.record(observation)
             episode_step += 1
             self._global_step += 1
 

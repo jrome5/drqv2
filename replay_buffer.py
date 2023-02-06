@@ -50,9 +50,32 @@ class ReplayBufferStorage:
             value = time_step[spec.name]
             if np.isscalar(value):
                 value = np.full(spec.shape, value, spec.dtype)
+            # print("spec: " + str(spec.shape) + str(spec.dtype))
+            # print("value: " + str(value.shape) + str(value.dtype))
             assert spec.shape == value.shape and spec.dtype == value.dtype
             self._current_episode[spec.name].append(value)
         if time_step.last():
+            episode = dict()
+            for spec in self._data_specs:
+                value = self._current_episode[spec.name]
+                episode[spec.name] = np.array(value, spec.dtype)
+            self._current_episode = defaultdict(list)
+            self._store_episode(episode)
+
+    def add(self, observation=None, action=None, discount=1.0, reward=0.0, done=False):
+        time_step = {
+                "observation":observation,
+                "action":action,
+                "discount":discount,
+                "reward":reward
+        }
+        for spec in self._data_specs:
+            value = time_step[spec.name]
+            if np.isscalar(value):
+                value = np.full(spec.shape, value, spec.dtype)
+            assert spec.shape == value.shape and spec.dtype == value.dtype, f"{spec.name}: {spec.shape}, {spec.dtype}. actual: {value.shape}. {value.dtype}"
+            self._current_episode[spec.name].append(value)
+        if done:
             episode = dict()
             for spec in self._data_specs:
                 value = self._current_episode[spec.name]
@@ -107,14 +130,20 @@ class ReplayBuffer(IterableDataset):
             early_eps_fn = self._episode_fns.pop(0)
             early_eps = self._episodes.pop(early_eps_fn)
             self._size -= episode_len(early_eps)
-            early_eps_fn.unlink(missing_ok=True)
+            try:
+                early_eps_fn.unlink()
+            except FileNotFoundError:
+                pass
         self._episode_fns.append(eps_fn)
         self._episode_fns.sort()
         self._episodes[eps_fn] = episode
         self._size += eps_len
 
         if not self._save_snapshot:
-            eps_fn.unlink(missing_ok=True)
+            try:
+                eps_fn.unlink()
+            except FileNotFoundError:
+                pass
         return True
 
     def _try_fetch(self):
