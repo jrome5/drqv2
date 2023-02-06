@@ -42,7 +42,7 @@ class VideoRecorder:
             frame = cv2.resize(obs[-3:].transpose(2, 1, 0),
                                dsize=(self.render_size, self.render_size),
                                interpolation=cv2.INTER_CUBIC)
-            self.frames.append(un_normalize(frame))
+            self.frames.append(frame)
 
     def save(self, file_name):
         if self.enabled:
@@ -73,7 +73,7 @@ class TrainVideoRecorder:
             frame = cv2.resize(obs[-3:].transpose(2, 1, 0),
                                dsize=(self.render_size, self.render_size),
                                interpolation=cv2.INTER_CUBIC)
-            self.frames.append(un_normalize(frame))
+            self.frames.append(frame)
 
     def save(self, file_name):
         if self.enabled:
