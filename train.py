@@ -196,7 +196,7 @@ class Workspace:
                 self.replay_storage.add(observation, action, discount, reward, done)
                 self.train_video_recorder.init(observation)
                 # try to save snapshot
-                if self.cfg.save_snapshot:
+                if self.cfg.save_snapshot and self._global_episode % self.cfg.save_snapshot_every == 0:
                     self.save_snapshot()
                 episode_step = 0
                 episode_reward = 0
@@ -238,6 +238,7 @@ class Workspace:
         payload = {k: self.__dict__[k] for k in keys_to_save}
         with snapshot.open('wb') as f:
             torch.save(payload, f)
+        print(f'snapshot saved to {snapshot}')
 
     def load_snapshot(self):
         snapshot = self.work_dir / 'snapshot.pt'
